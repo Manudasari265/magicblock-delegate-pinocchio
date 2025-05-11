@@ -3,7 +3,7 @@ use pinocchio::{
     program_error::ProgramError, pubkey::Pubkey, ProgramResult,
 };
 
-use crate::instruction::{self, EscrowInstruction};
+use crate::instruction::{self, DelegationProgram};
 
 // This is the entrypoint for the program.
 program_entrypoint!(process_instruction);
@@ -22,19 +22,8 @@ pub fn process_instruction(
             .split_first()
             .ok_or(ProgramError::InvalidInstructionData)?;
 
-    match EscrowInstruction::try_from(discriminator_variant)? {
-        EscrowInstruction::MakeOffer => {
-            instruction::process_make_offer_instruction(accounts, instruction_data)?;
-        }
-        EscrowInstruction::TakeOffer => {
-            instruction::process_take_offer_instruction(accounts)?;
-        }
-        EscrowInstruction::RefundOffer => {
-            instruction::process_refund_offer_instruction(accounts)?;
-        }
-        EscrowInstruction::Delegate => {
-            instruction::process_delegate_account(accounts, instruction_data)?;
-        }
+    match DelegationProgram::try_from(instruction_data)? {
+        DelegationProgram::Delegate => instruction::process_delegate(accounts, instruction_data)?,
     }
 
     Ok(())

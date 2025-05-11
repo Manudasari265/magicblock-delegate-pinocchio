@@ -13,7 +13,9 @@ pub enum MyProgramError {
     // Invalid Owner
     InvalidOwner,
     // Account is Empty
-    AccountEmpty
+    AccountEmpty,
+    // Failed serialization
+    SerializationFailed,
 }
 
 impl From<MyProgramError> for ProgramError {
