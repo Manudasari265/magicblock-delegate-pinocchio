@@ -13,57 +13,16 @@ use crate::{
     types::{DelegateAccountArgs, DelegateConfig},
 };
 
-pub trait DataLen {
-    const LEN: usize;
-}
-
-pub trait Initialized {
-    fn is_initialized(&self) -> bool;
-}
-
-pub fn deserialize_delegate_instruction_data(instruction_data: &[u8]) -> Result<(Vec<Vec<u8>>, DelegateConfig), ProgramError> {
-    let mut offset = 0;
-
-    // first byte provides total number of seeds
-    if instruction_data.len() < 1 {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-
-    let num_seeds = instruction_data[0] as usize;
-    offset += 1;
-
-    // extract the delegated seeds
-    let mut seeds = Vec::with_capacity(num_seeds);
-
-    for _ in 0..num_seeds {
-        if instruction_data.len() < offset + 1 {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-
-        // first byte is out seed length
-        let seed_len = instruction_data[0] as usize;
-        offset += 1;
-
-        let seed = instruction_data[offset..offset + seed_len].to_vec();
-        seeds.push(seed);
-        offset += seed_len;
-    }
-
-    // bytemuck deserialization DelegateConfig
-    let config = parse_delegate_config(&instruction_data[offset..])?;
-
-    Ok((seeds, config))
-}
-
-pub fn parse_delegate_config(instruction_data: &[u8]) -> Result<DelegateConfig, ProgramError> {
-    if instruction_data.len() < 4 {
+//helper to deserialize using bytemuck
+pub fn parse_delegate_config(data: &[u8]) -> Result<DelegateConfig, ProgramError> {
+    if data.len() < 4 {
         return Err(MyProgramError::SerializationFailed.into());
     }
 
-    let commit_frequency_ms = *from_bytes::u32(&instruction_data[..4]);
+    let commit_frequency_ms = *from_bytes::<u32>(&data[..4]);
 
-    let validator = if instruction_data.len() >= 36 {
-        Some(instruction_data[4..36].try_into().unwrap())
+    let validator = if data.len() >= 36 {
+        Some(data[4..36].try_into().unwrap())
     } else {
         None
     };
@@ -72,6 +31,102 @@ pub fn parse_delegate_config(instruction_data: &[u8]) -> Result<DelegateConfig, 
         commit_frequency_ms,
         validator,
     })
+}
+
+//helper to serialize using bytemuck (providing slice length descriminators)
+pub fn serialize_delegate_account_args(args: &DelegateAccountArgs) -> Vec<u8> {
+    let mut data = Vec::new();
+
+    // Serialize commit_frequency_ms (4 bytes)
+    data.extend_from_slice(&args.commit_frequency_ms.to_le_bytes());
+
+    // Serialize seeds (Vec<Vec<u8>>)
+    // First, serialize the number of seeds (as a u8)
+    let num_seeds = args.seeds.len() as u8;
+    data.extend_from_slice(&num_seeds.to_le_bytes());
+
+    // Then, serialize each seed (each &[u8])
+    for seed in &args.seeds {
+        let seed_len = seed.len() as u32;
+        data.extend_from_slice(&seed_len.to_le_bytes()); // Seed length
+        data.extend_from_slice(&seed); // Seed content
+    }
+
+    // Serialize validator (32 bytes)
+    if let Some(pubkey) = args.validator {
+        data.extend_from_slice(&pubkey);
+    }
+    //if they use a u8 to check if it is Some or None we need to extend_from_slice that byte
+
+    data
+}
+
+//Deserialize data using borsh and some assumptions
+//we need the array length descriminator and another
+//descriminator for the length of the inner arrays
+pub fn deserialize_delegate_ix_data(
+    ix_data: &[u8],
+) -> Result<(Vec<Vec<u8>>, DelegateConfig), ProgramError> {
+    let mut offset = 0;
+
+    // First byte provides total number of seeds
+    if ix_data.len() < 1 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let num_seeds = ix_data[0] as usize;
+    offset += 1;
+
+    // Extract the seeds
+    let mut seeds = Vec::with_capacity(num_seeds);
+
+    for _ in 0..num_seeds {
+        if ix_data.len() < offset + 1 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        //first byte is out seed length
+        let seed_len = ix_data[offset] as usize;
+        offset += 1;
+
+        let seed = ix_data[offset..offset + seed_len].to_vec();
+        seeds.push(seed);
+        offset += seed_len;
+    }
+
+    // Borsh Deserialize DelegateConfig (we might change this to bytemuck see parse_delegate_config)
+    let config = parse_delegate_config(&ix_data[offset..])?;
+
+    Ok((seeds, config))
+}
+
+pub fn deserialize_undelegate_ix_data(ix_data: &[u8]) -> Result<Vec<Vec<u8>>, ProgramError> {
+    let mut offset = 0;
+
+    // First byte provides total number of seeds
+    if ix_data.len() < 1 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let num_seeds = ix_data[0] as usize;
+    offset += 1;
+
+    // Extract the seeds
+    let mut seeds = Vec::with_capacity(num_seeds);
+
+    for _ in 0..num_seeds {
+        if ix_data.len() < offset + 1 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        //first byte is out seed length
+        let seed_len = ix_data[offset] as usize;
+        offset += 1;
+
+        let seed = ix_data[offset..offset + seed_len].to_vec();
+        seeds.push(seed);
+        offset += seed_len;
+    }
+
+    Ok(seeds)
 }
 
 #[inline(always)]
@@ -84,6 +139,26 @@ pub fn get_seeds<'a>(seeds_vec: Vec<&'a [u8]>) -> Result<Vec<Seed<'a>>, ProgramE
     }
 
     Ok(seeds)
+}
+
+pub fn close_pda_acc(
+    payer: &AccountInfo,
+    pda_acc: &AccountInfo,
+    system_program: &AccountInfo,
+) -> Result<(), ProgramError> {
+    // Step 1 - Lamports to zero
+    unsafe {
+        *payer.borrow_mut_lamports_unchecked() += *pda_acc.borrow_lamports_unchecked();
+        *pda_acc.borrow_mut_lamports_unchecked() = 0;
+    }
+
+    // Step 2 - Empty the data
+    pda_acc.realloc(0, false).unwrap();
+
+    // Step 3 - Send to System Program
+    unsafe { pda_acc.assign(system_program.key()) };
+
+    Ok(())
 }
 
 pub fn cpi_delegate(
@@ -130,76 +205,37 @@ pub fn cpi_delegate(
     Ok(())
 }
 
-pub fn close_pda_acc(
-    payer: &AccountInfo,
-    pda_acc: &AccountInfo,
-    system_program: &AccountInfo,
-) -> Result<(), ProgramError> {
-    // Step 1 - Lamports to zero
-    unsafe {
-        *payer.borrow_mut_lamports_unchecked() += *pda_acc.borrow_lamports_unchecked();
-        *pda_acc.borrow_mut_lamports_unchecked() = 0;
-    }
-
-    // Step 2 - Empty the data
-    pda_acc.realloc(0, false).unwrap();
-
-    // Step 3 - Send to System Program
-    unsafe { pda_acc.assign(system_program.key()) };
-
-    Ok(())
+pub struct CommitIx<'a> {
+    pub program_id: &'a [u8; PUBKEY_BYTES],
+    pub data: Vec<u8>,
+    pub accounts: Vec<AccountMeta<'a>>,
 }
 
-#[inline(always)]
-pub fn load_acc<T: DataLen + Initialized>(bytes: &[u8]) -> Result<&T, ProgramError> {
-    load_acc_unchecked::<T>(bytes).and_then(|acc| {
-        if acc.is_initialized() {
-            Ok(acc)
-        } else {
-            Err(ProgramError::UninitializedAccount)
-        }
-    })
-}
-
-#[inline(always)]
-pub fn load_acc_unchecked<T: DataLen>(bytes: &[u8]) -> Result<&T, ProgramError> {
-    if bytes.len() != T::LEN {
-        return Err(ProgramError::InvalidAccountData);
-    }
-    Ok(unsafe { &*(bytes.as_ptr() as *const T) })
-}
-
-#[inline(always)]
-pub fn load_acc_mut<T: DataLen + Initialized>(bytes: &mut [u8]) -> Result<&mut T, ProgramError> {
-    load_acc_mut_unchecked::<T>(bytes).and_then(|acc| {
-        if acc.is_initialized() {
-            Ok(acc)
-        } else {
-            Err(ProgramError::UninitializedAccount)
-        }
-    })
-}
-
-#[inline(always)]
-pub fn load_acc_mut_unchecked<T: DataLen>(bytes: &mut [u8]) -> Result<&mut T, ProgramError> {
-    if bytes.len() != T::LEN {
-        return Err(ProgramError::InvalidAccountData);
-    }
-    Ok(unsafe { &mut *(bytes.as_mut_ptr() as *mut T) })
-}
-
-#[inline(always)]
-pub fn load_ix_data<T: DataLen>(bytes: &[u8]) -> Result<&T, ProgramError> {
-    if bytes.len() != T::LEN {
-        return Err(MyProgramError::InvalidInstructionData.into());
-    }
-    Ok(unsafe { &*(bytes.as_ptr() as *const T) })
-}
-
-pub fn to_bytes<T: DataLen>(data: &T) -> &[u8] {
-    unsafe { core::slice::from_raw_parts(data as *const T as *const u8, T::LEN) }
-}
-
-pub fn to_mut_bytes<T: DataLen>(data: &mut T) -> &mut [u8] {
-    unsafe { core::slice::from_raw_parts_mut(data as *mut T as *mut u8, T::LEN) }
+pub fn create_schedule_commit_ix<'a>(
+    payer: &'a AccountInfo,
+    account_infos: &'a [AccountInfo],
+    magic_context: &'a AccountInfo,
+    magic_program: &'a AccountInfo,
+    allow_undelegation: bool,
+) -> CommitIx<'a> {
+    let instruction_data: Vec<u8> = if allow_undelegation {
+        vec![2, 0, 0, 0]
+    } else {
+        vec![1, 0, 0, 0]
+    };
+    let mut account_metas = vec![
+        AccountMeta::new(payer.key(), true, true),
+        AccountMeta::new(magic_context.key(), true, false),
+    ];
+    account_metas.extend(
+        account_infos
+            .iter()
+            .map(|acc| AccountMeta::new(acc.key(), true, true)),
+    );
+    let instruction = CommitIx {
+        program_id: magic_program.key(),
+        data: instruction_data,
+        accounts: account_metas,
+    };
+    instruction
 }
